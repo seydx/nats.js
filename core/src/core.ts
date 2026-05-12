@@ -396,6 +396,24 @@ export interface NatsConnection {
   close(): Promise<void>;
 
   /**
+   * camera.ui fork patch.
+   * Synchronous force-close that drops state without awaiting the transport's
+   * close handshake. Use when the underlying network is known-dead and the
+   * usual {@link close} would hang on a half-open WebSocket. After this call
+   * the connection MUST be treated as unusable (same as {@link close}).
+   */
+  abortClose(err?: Error): void;
+
+  /**
+   * camera.ui fork patch.
+   * Like {@link reconnect}, but also works when the client is currently
+   * disconnected: cancels any pending reconnect delay or stuck dial-handshake
+   * race timer so the next dial-loop iteration picks up the current servers
+   * list immediately. If no dial loop is running, starts one.
+   */
+  forceReconnect(): Promise<void>;
+
+  /**
    * Publishes the specified data to the specified subject.
    * @param subject
    * @param payload
@@ -1047,6 +1065,17 @@ export interface ConnectionOptions {
    * server the client should dial next. See {@link ReconnectToServerHandler}.
    */
   reconnectToServer?: ReconnectToServerHandler;
+
+  /**
+   * camera.ui fork patch.
+   * Optional AbortSignal that cancels an in-flight `connect()`. On abort the
+   * client synchronously runs the same cleanup path as {@link NatsConnection.abortClose},
+   * cancelling any pending dialDelay / raceTimer and breaking the dial loop.
+   * The connect() promise rejects with the signal's reason (or an AbortError).
+   * Use this for race-to-recover patterns where a losing candidate must stop
+   * dialing the moment another candidate wins.
+   */
+  signal?: AbortSignal;
 }
 
 /**

@@ -77,6 +77,24 @@ function isDelayedServer(
   );
 }
 
+// camera.ui fork patch — coerce an aborted-signal reason into a thrown value.
+// Browser AbortControllers populate `signal.reason` (DOMException or the
+// arg passed to `abort()`); we wrap plain reasons as Error to keep callers
+// from having to handle non-Error throws.
+function abortReason(signal: AbortSignal): Error {
+  const reason = (signal as { reason?: unknown }).reason;
+  if (reason instanceof Error) return reason;
+  if (typeof reason === "string") return new Error(reason);
+  if (reason !== undefined && reason !== null) {
+    try {
+      return new Error(String(reason));
+    } catch {
+      // ignore — fall through to default
+    }
+  }
+  return new Error("aborted");
+}
+
 export class Connect {
   echo?: boolean;
   no_responders?: boolean;
@@ -536,6 +554,43 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     return Promise.resolve();
   }
 
+  // camera.ui fork patch.
+  // Unlike reconnect(), this works also when the protocol is NOT in the
+  // connected state — e.g. dial loop is sleeping on dialDelay or stuck on
+  // raceTimer mid-handshake against a now-unreachable host. Cancelling those
+  // timers makes the loop's current iteration resolve immediately so it
+  // picks up the current (possibly just-updated) servers list. If neither
+  // a live connection nor a running dial loop exists, kicks off a fresh one.
+  public forceReconnect(): Promise<void> {
+    this.dispatchStatus({ type: "forceReconnect" });
+    this.dialDelay?.cancel();
+    this.raceTimer?.cancel();
+
+    if (this.connected) {
+      // disconnected() handler runs dialLoop() with current servers.
+      this.transport.disconnect();
+      return Promise.resolve();
+    }
+
+    if (this.connectPromise === null && !this._closed) {
+      // No live dial loop — start one. close()-style finally clears
+      // connectPromise so subsequent calls are idempotent.
+      return this.dialLoop()
+        .then(() => {
+          this.dispatchStatus({
+            type: "reconnect",
+            server: this.servers.getCurrentServer().toString(),
+          });
+        })
+        .catch((err) => {
+          // dialLoop exhausted — fall back to existing close path.
+          this.close(err).catch(() => {});
+        });
+    }
+
+    return Promise.resolve();
+  }
+
   async disconnected(err?: Error): Promise<void> {
     this.dispatchStatus(
       {
@@ -744,8 +799,37 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     publisher: Publisher,
   ): Promise<ProtocolHandler> {
     const h = new ProtocolHandler(options, publisher);
-    await h.dialLoop();
-    return h;
+
+    // camera.ui fork patch — see ConnectionOptions.signal docstring.
+    // The handler is constructed BEFORE dialing starts, so we wire the
+    // abort listener now: an abort cancels dialDelay/raceTimer and flips
+    // abortReconnect → the dial loop throws on its next iteration.
+    const signal = options.signal;
+    let onAbort: (() => void) | undefined;
+    if (signal) {
+      if (signal.aborted) {
+        const reason = abortReason(signal);
+        h.abortClose(reason);
+        throw reason;
+      }
+      onAbort = () => {
+        try {
+          h.abortClose(abortReason(signal));
+        } catch (_e) {
+          // ignore — best-effort cleanup
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    try {
+      await h.dialLoop();
+      return h;
+    } finally {
+      if (signal && onAbort) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
   }
 
   static toError(s: string): Error {
@@ -1116,6 +1200,43 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     await this.transport.close(err);
     this.raceTimer?.cancel();
     this.dialDelay?.cancel();
+    this.closed.resolve(err);
+  }
+
+  // camera.ui fork patch.
+  // Synchronous force-close: tears down state without awaiting transport
+  // close or listener iterators. Use when the network is known-dead and
+  // graceful shutdown would hang on the close handshake. Caller MUST treat
+  // this handler as unusable after this call (same as close()).
+  abortClose(err?: Error): void {
+    if (this._closed) {
+      return;
+    }
+    this.whyClosed = new Error("abortClose trace").stack || "";
+    this._closed = true;
+    this.abortReconnect = true;
+    this.heartbeats.cancel();
+    if (this.connectError) {
+      this.connectError(err);
+      this.connectError = undefined;
+    }
+    this.muxSubscriptions.close();
+    this.subscriptions.close();
+    for (let i = 0; i < this.listeners.length; i++) {
+      const qi = this.listeners[i];
+      if (qi) {
+        qi.push({ type: "close" });
+        qi.stop();
+      }
+    }
+    this.raceTimer?.cancel();
+    this.dialDelay?.cancel();
+    // Fire-and-forget — transport.close on a dead WS may never resolve.
+    try {
+      this.transport?.close(err);
+    } catch (_e) {
+      // ignore
+    }
     this.closed.resolve(err);
   }
 

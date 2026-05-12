@@ -82,6 +82,11 @@ export class NatsConnectionImpl implements NatsConnection {
     await this.protocol.close();
   }
 
+  // camera.ui fork patch — see ProtocolHandler.abortClose for semantics.
+  abortClose(err?: Error): void {
+    this.protocol.abortClose(err);
+  }
+
   _check(subject: string, sub: boolean, pub: boolean) {
     if (this.isClosed()) {
       throw new errors.ClosedConnectionError();
@@ -584,6 +589,17 @@ export class NatsConnectionImpl implements NatsConnection {
       return Promise.reject(new errors.DrainingConnectionError());
     }
     return this.protocol.reconnect();
+  }
+
+  // camera.ui fork patch — see ProtocolHandler.forceReconnect for semantics.
+  forceReconnect(): Promise<void> {
+    if (this.isClosed()) {
+      return Promise.reject(new errors.ClosedConnectionError());
+    }
+    if (this.isDraining()) {
+      return Promise.reject(new errors.DrainingConnectionError());
+    }
+    return this.protocol.forceReconnect();
   }
 
   // internal
