@@ -204,7 +204,16 @@ export class WsTransport implements Transport {
     }
     this.closeError = err;
     if (!err) {
+      // camera.ui fork patch — bound the graceful-drain wait.
+      // A silent-dead TCP socket (5G handoff, carrier NAT-evict, etc.) keeps
+      // bufferedAmount > 0 forever because the OS never gets to flush the
+      // bytes and never reports the failure. Upstream waits indefinitely,
+      // which traps the protocol in `staleConnection` with no recovery path.
+      // After DRAIN_TIMEOUT_MS we accept the loss and force-close below.
+      const DRAIN_TIMEOUT_MS = 3000;
+      const drainStart = Date.now();
       while (!this.socketClosed && this.socket.bufferedAmount > 0) {
+        if (Date.now() - drainStart >= DRAIN_TIMEOUT_MS) break;
         await delay(100);
       }
     }
@@ -214,6 +223,12 @@ export class WsTransport implements Transport {
     } catch (_) {
       // ignore this
     }
+
+    // camera.ui fork patch — guarantee `closedNotification` resolves even if
+    // the underlying WebSocket never fires `onclose`/`onerror` (zombie sockets
+    // observed in WKWebView on flaky cellular). _cleanup() is idempotent —
+    // if onclose does fire later, the second call is a no-op.
+    this._cleanup();
 
     return this.closedNotification as Promise<void>;
   }
