@@ -47,6 +47,7 @@ import type {
 import {
   DEFAULT_MAX_PING_OUT,
   DEFAULT_PING_INTERVAL,
+  DEFAULT_PING_TIMEOUT,
   DEFAULT_RECONNECT_TIME_WAIT,
 } from "./options.ts";
 import { errors, InvalidArgumentError } from "./errors.ts";
@@ -483,6 +484,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       this as PH,
       this.options.pingInterval || DEFAULT_PING_INTERVAL,
       this.options.maxPingOut || DEFAULT_MAX_PING_OUT,
+      this.options.pingTimeout ?? DEFAULT_PING_TIMEOUT,
     );
   }
 
@@ -711,11 +713,11 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
         // in the case of close, want to stop.
         this.servers.clear();
       }
+      const srv = this.selectServer();
       const wait = this.options.reconnectDelayHandler
-        ? this.options.reconnectDelayHandler()
+        ? this.options.reconnectDelayHandler(srv?.reconnects ?? 0)
         : DEFAULT_RECONNECT_TIME_WAIT;
       let maxWait = wait;
-      const srv = this.selectServer();
       if (!srv || this.abortReconnect) {
         if (lastError) {
           throw lastError;

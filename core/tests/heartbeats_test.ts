@@ -80,6 +80,48 @@ Deno.test("heartbeat - errors fire on missed maxOut", async () => {
   assertEquals(status[0].type, "ping");
 });
 
+Deno.test("heartbeat - pingTimeout disconnects before maxOut", async () => {
+  // flush never resolves for any ping — without pingTimeout this would take
+  // interval × maxOut = 1000ms; with pingTimeout=200 it must disconnect sooner.
+  const disconnect = deferred<void>();
+  const ph = pm(0, () => {
+    disconnect.resolve();
+  }, () => {}, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+  const interval = 200;
+  const maxOut = 3;
+  const timeout = 150;
+  const hb = new Heartbeat(ph, interval, maxOut, timeout);
+  const started = Date.now();
+  hb._schedule();
+  await disconnect;
+  const elapsed = Date.now() - started;
+  // first tick at `interval`, then `timeout` until the per-ping timer fires
+  assert(
+    elapsed < interval * maxOut,
+    `elapsed ${elapsed}ms must be < ${interval * maxOut}ms (interval × maxOut)`,
+  );
+  assert(
+    elapsed >= interval + timeout - 50,
+    `elapsed ${elapsed}ms must be >= ${interval + timeout - 50}ms`,
+  );
+  assertEquals(hb.timer, undefined);
+});
+
+Deno.test("heartbeat - pingTimeout cleared on pong", async () => {
+  // flush resolves quickly (lag=10) — pingTimeout=50 should be cleared every
+  // time before it can fire, so we never disconnect.
+  const ph = pm(10, () => {
+    fail("shouldn't have disconnected");
+  }, () => {});
+  const hb = new Heartbeat(ph, 100, 3, 50);
+  hb._schedule();
+  await delay(400);
+  hb.cancel();
+  await delay(50);
+  assertEquals(hb.timer, undefined);
+});
+
 Deno.test("heartbeat - recovers from missed", async () => {
   let maxPending = 0;
   const d = deferred<void>();

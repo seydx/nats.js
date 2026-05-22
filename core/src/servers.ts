@@ -227,6 +227,16 @@ export class Servers {
         // user-supplied = not gossiped. otherwise a later cluster update()
         // could remove an entry the user explicitly asked for.
         surviving.gossiped = false;
+        // camera.ui fork patch.
+        // `existing.get(listen)` keys only on `host:port`, so a re-issued
+        // URL that differs only in its query string (e.g., a rotated auth
+        // token in `?token=…`) would be silently dropped — the recycled
+        // ServerImpl still carries the OLD `src`, and the next reconnect
+        // would dial that stale URL. Update `src` in place so the new query
+        // is what gets used by the WS transport on the next dial.
+        if (surviving.src !== hp) {
+          surviving.src = hp;
+        }
         merged.push(surviving);
       } else {
         merged.push(new ServerImpl(hp));

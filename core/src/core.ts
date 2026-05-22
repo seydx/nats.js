@@ -948,6 +948,22 @@ export interface ConnectionOptions {
    */
   pingInterval?: number;
   /**
+   * Sets the maximum number of milliseconds to wait for a PONG response to an
+   * individual PING before considering the connection stale and initiating a
+   * reconnect.
+   *
+   * When set to `0` (default) the per-ping timeout is disabled and the client
+   * falls back to the legacy behavior, where the connection is only considered
+   * stale once {@link maxPingOut} PINGs have accumulated without any PONG
+   * arriving (effective worst-case detection time = `pingInterval × maxPingOut`).
+   *
+   * When set to a positive value, each PING starts its own timer; if no PONG
+   * arrives within `pingTimeout` ms, the connection is torn down immediately.
+   *
+   * @default 0 (disabled)
+   */
+  pingTimeout?: number;
+  /**
    * Sets the port number on the localhost (127.0.0.1) where the nats-server is running.
    * This option is mutually exclusive with {@link servers}.
    */
@@ -961,8 +977,35 @@ export interface ConnectionOptions {
   /**
    * Set a function that dynamically determines the number of milliseconds
    * that the client should wait for the next reconnect attempt.
+   *
+   * The handler receives `attempt` — the current per-server reconnect attempt
+   * count (0 on the initial dial, incremented on each failed dial, reset to 0
+   * after a successful reconnect). Existing handlers with arity 0 keep working
+   * unchanged.
    */
-  reconnectDelayHandler?: () => number;
+  reconnectDelayHandler?: (attempt: number) => number;
+  /**
+   * Upper bound for the reconnect delay in milliseconds. When set to a value
+   * greater than 0, switches the default reconnect-delay handler from the
+   * legacy linear scheme to exponential backoff:
+   *   `min(reconnectTimeWait × 2^attempt, reconnectionDelayMax)`
+   * combined with {@link reconnectionRandomizationFactor} for multiplicative
+   * jitter. Has no effect when a custom {@link reconnectDelayHandler} is
+   * provided.
+   *
+   * @default 0 (disabled — legacy linear delay)
+   */
+  reconnectionDelayMax?: number;
+  /**
+   * Multiplicative jitter factor in `[0, 1]` applied to the computed reconnect
+   * delay when {@link reconnectionDelayMax} is active. A factor of `0.5`
+   * yields a final delay uniformly distributed in `[delay × 0.5, delay × 1.5]`.
+   * Ignored when the legacy linear scheme is active — use
+   * {@link reconnectJitter} there instead.
+   *
+   * @default 0 (no multiplicative jitter)
+   */
+  reconnectionRandomizationFactor?: number;
   /**
    * Set the upper bound for a random delay in milliseconds added to
    * {@link reconnectTimeWait}.

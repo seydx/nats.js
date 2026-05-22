@@ -31,9 +31,16 @@ export const DEFAULT_JITTER_TLS = 1000;
 // Ping interval
 export const DEFAULT_PING_INTERVAL = 2 * 60 * 1000; // 2 minutes
 export const DEFAULT_MAX_PING_OUT = 2;
+export const DEFAULT_PING_TIMEOUT = 0;
 
 // DISCONNECT Parameters, 2 sec wait, 10 tries
 export const DEFAULT_RECONNECT_TIME_WAIT = 2 * 1000;
+// Upper bound for exponential reconnect-delay backoff. 0 = disabled (legacy
+// linear behavior).
+export const DEFAULT_RECONNECTION_DELAY_MAX = 0;
+// Multiplicative jitter factor [0..1] applied to the computed delay. 0 = no
+// multiplicative jitter (legacy `reconnectJitter` additive jitter still applies).
+export const DEFAULT_RECONNECTION_RANDOMIZATION_FACTOR = 0;
 
 export function defaultOptions(): ConnectionOptions {
   return {
@@ -125,7 +132,24 @@ export function parseOptions(opts?: ConnectionOptions): ConnectionOptions {
   });
 
   if (!options.reconnectDelayHandler) {
-    options.reconnectDelayHandler = () => {
+    options.reconnectDelayHandler = (attempt = 0) => {
+      const base = options.reconnectTimeWait ?? DEFAULT_RECONNECT_TIME_WAIT;
+      const max = options.reconnectionDelayMax ?? DEFAULT_RECONNECTION_DELAY_MAX;
+      const factor = options.reconnectionRandomizationFactor ??
+        DEFAULT_RECONNECTION_RANDOMIZATION_FACTOR;
+
+      // exponential backoff with cap + multiplicative jitter
+      if (max > 0) {
+        let d = Math.min(base * Math.pow(2, Math.max(0, attempt)), max);
+        if (factor > 0) {
+          const lo = d * (1 - factor);
+          const hi = d * (1 + factor);
+          d = lo + Math.random() * (hi - lo);
+        }
+        return Math.round(d);
+      }
+
+      // legacy: constant base + additive jitter
       let extra = options.tls
         ? options.reconnectJitterTLS
         : options.reconnectJitter;
@@ -133,7 +157,7 @@ export function parseOptions(opts?: ConnectionOptions): ConnectionOptions {
         extra++;
         extra = Math.floor(Math.random() * extra);
       }
-      return options.reconnectTimeWait + extra;
+      return base + (extra ?? 0);
     };
   }
 

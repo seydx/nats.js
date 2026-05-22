@@ -27,13 +27,15 @@ export class Heartbeat {
   ph: PH;
   interval: number;
   maxOut: number;
+  timeout: number;
   timer?: number;
   pendings: Promise<void>[];
 
-  constructor(ph: PH, interval: number, maxOut: number) {
+  constructor(ph: PH, interval: number, maxOut: number, timeout = 0) {
     this.ph = ph;
     this.interval = interval;
     this.maxOut = maxOut;
+    this.timeout = timeout;
     this.pendings = [];
   }
 
@@ -69,12 +71,31 @@ export class Heartbeat {
         return;
       }
       const ping = deferred<void>();
+
+      // if no PONG within `timeout` ms, kill
+      // the connection without waiting for the next interval tick.
+      let pingTimer: ReturnType<typeof setTimeout> | undefined;
+      if (this.timeout > 0) {
+        pingTimer = setTimeout(() => {
+          pingTimer = undefined;
+          this.cancel(true);
+        }, this.timeout);
+      }
+      const clearPingTimer = () => {
+        if (pingTimer !== undefined) {
+          clearTimeout(pingTimer);
+          pingTimer = undefined;
+        }
+      };
+
       this.ph.flush(ping)
         .then(() => {
+          clearPingTimer();
           this._reset();
         })
         .catch(() => {
           // we disconnected - pongs were rejected
+          clearPingTimer();
           this.cancel();
         });
       this.pendings.push(ping);
