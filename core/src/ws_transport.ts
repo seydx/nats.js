@@ -152,7 +152,14 @@ export class WsTransport implements Transport {
     // @ts-ignore: CloseEvent is provided in browsers
     this.socket.onclose = (evt: CloseEvent) => {
       let reason: Error | undefined;
-      if (!evt.wasClean && evt.reason !== "") {
+      // camera.ui fork patch — application close codes (4000-4999) carry
+      // semantic information from the server (e.g. 4401 = auth required).
+      // Surface them as Errors regardless of `wasClean`, since a server-
+      // initiated `close(code, reason)` post-upgrade lands as a clean close
+      // and the original `!evt.wasClean` gate would silently drop it.
+      if (evt.code >= 4000 && evt.code <= 4999) {
+        reason = new Error(evt.reason || `close code ${evt.code}`);
+      } else if (!evt.wasClean && evt.reason !== "") {
         reason = new Error(evt.reason);
       }
       this._closed(reason);
