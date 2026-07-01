@@ -414,6 +414,15 @@ export interface NatsConnection {
   forceReconnect(): Promise<void>;
 
   /**
+   * camera.ui fork patch.
+   * Returns true when the heartbeat's wall-clock deadline has passed — i.e. the
+   * connection is stale even though its (background-throttled) ping timer has
+   * not yet fired. Lets callers detect a frozen connection on resume without
+   * waiting out a ping timeout.
+   */
+  isStale(): boolean;
+
+  /**
    * Publishes the specified data to the specified subject.
    * @param subject
    * @param payload

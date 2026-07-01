@@ -30,6 +30,15 @@ export class Heartbeat {
   timeout: number;
   timer?: number;
   pendings: Promise<void>[];
+  // camera.ui fork patch — absolute wall-clock deadline by which a live
+  // connection must have completed a ping/pong cycle. Reset on every answered
+  // ping. The `interval`/`timeout` setTimeouts are throttled (or frozen for
+  // minutes) when a mobile app is backgrounded, so on resume they'd grant the
+  // dead socket a whole fresh `timeout` window before noticing. Comparing
+  // `Date.now()` against this deadline (see `hasExpired`) detects the stale
+  // connection immediately — the same trick engine.io uses for its ping
+  // timeout — instead of trusting a timer that stopped ticking.
+  deadline: number;
 
   constructor(ph: PH, interval: number, maxOut: number, timeout = 0) {
     this.ph = ph;
@@ -37,6 +46,7 @@ export class Heartbeat {
     this.maxOut = maxOut;
     this.timeout = timeout;
     this.pendings = [];
+    this.deadline = 0;
   }
 
   // api to start the heartbeats, since this can be
@@ -44,6 +54,7 @@ export class Heartbeat {
   // leak timers
   start() {
     this.cancel();
+    this._arm();
     this._schedule();
   }
 
@@ -54,15 +65,37 @@ export class Heartbeat {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
+    this.deadline = 0;
     this._reset();
     if (stale) {
       this.ph.disconnect();
     }
   }
 
+  // camera.ui fork patch — push the wall-clock deadline forward by one full
+  // ping/pong window. Called on start and whenever a ping is answered.
+  _arm() {
+    const window = this.interval + (this.timeout > 0 ? this.timeout : this.interval);
+    this.deadline = Date.now() + window;
+  }
+
+  // camera.ui fork patch — wall-clock staleness check, immune to timer freezing
+  // while backgrounded. `false` when disarmed (deadline === 0).
+  hasExpired(): boolean {
+    return this.deadline > 0 && Date.now() > this.deadline;
+  }
+
   _schedule() {
     // @ts-ignore: node is not a number - we treat this opaquely
     this.timer = setTimeout(() => {
+      // camera.ui fork patch — if the timer fires after having been frozen
+      // (mobile resume) past the point a ping should have been answered, the
+      // connection is stale NOW. Disconnect immediately instead of sending a
+      // doomed ping and waiting out another full `timeout`.
+      if (this.hasExpired()) {
+        this.cancel(true);
+        return;
+      }
       this.ph.dispatchStatus(
         { type: "ping", pendingPings: this.pendings.length + 1 },
       );
@@ -91,6 +124,7 @@ export class Heartbeat {
       this.ph.flush(ping)
         .then(() => {
           clearPingTimer();
+          this._arm();
           this._reset();
         })
         .catch(() => {

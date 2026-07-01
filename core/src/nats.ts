@@ -87,6 +87,11 @@ export class NatsConnectionImpl implements NatsConnection {
     this.protocol.abortClose(err);
   }
 
+  // camera.ui fork patch — see ProtocolHandler.isStale for semantics.
+  isStale(): boolean {
+    return !this.isClosed() && this.protocol.isStale();
+  }
+
   _check(subject: string, sub: boolean, pub: boolean) {
     if (this.isClosed()) {
       throw new errors.ClosedConnectionError();

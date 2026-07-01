@@ -593,6 +593,14 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     return Promise.resolve();
   }
 
+  // camera.ui fork patch — wall-clock staleness of the heartbeat. Lets external
+  // callers (transport health / app resume) detect a connection frozen while
+  // backgrounded immediately, instead of waiting for the throttled heartbeat
+  // timer to fire and time out its ping.
+  public isStale(): boolean {
+    return this.connected && this.heartbeats.hasExpired();
+  }
+
   async disconnected(err?: Error): Promise<void> {
     this.dispatchStatus(
       {
