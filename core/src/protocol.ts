@@ -566,15 +566,32 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
   public forceReconnect(): Promise<void> {
     this.dispatchStatus({ type: "forceReconnect" });
     this.dialDelay?.cancel();
-    this.raceTimer?.cancel();
 
     if (this.connected) {
+      this.raceTimer?.cancel();
       // disconnected() handler runs dialLoop() with current servers.
       this.transport.disconnect();
       return Promise.resolve();
     }
 
-    if (this.connectPromise === null && !this._closed) {
+    if (this.connectPromise !== null) {
+      // Dial loop is mid-handshake. Do NOT cancel raceTimer here:
+      // timeout().cancel() clears the timer without settling the promise,
+      // so cancelling would defuse the only deadline guarding a zombie
+      // transport — the dial could then hang forever and every further
+      // forceReconnect() would be a no-op (connectPromise stays non-null).
+      // Instead keep the deadline armed and force the current attempt to
+      // fail fast; the loop then retries with the updated servers list.
+      try {
+        this.transport?.disconnect();
+      } catch (_) {
+        // ignore — the race timer still bounds the attempt
+      }
+      return Promise.resolve();
+    }
+
+    if (!this._closed) {
+      this.raceTimer?.cancel();
       // No live dial loop — start one. close()-style finally clears
       // connectPromise so subsequent calls are idempotent.
       return this.dialLoop()
