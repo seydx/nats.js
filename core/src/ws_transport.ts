@@ -72,6 +72,9 @@ export class WsTransport implements Transport {
   yields: Uint8Array[];
   signal: Deferred<void>;
   closedNotification: Deferred<void | Error>;
+  // camera.ui fork patch — the in-flight connect() deferred, so _closed()
+  // can settle a dial attempt that is killed mid-handshake (see below).
+  private pendingConnect: Deferred<void> | null;
 
   constructor() {
     this.version = VERSION;
@@ -84,6 +87,7 @@ export class WsTransport implements Transport {
     this.yields = [];
     this.signal = deferred();
     this.closedNotification = deferred();
+    this.pendingConnect = null;
   }
 
   async connect(
@@ -92,6 +96,7 @@ export class WsTransport implements Transport {
   ): Promise<void> {
     const connected = false;
     const ok = deferred<void>();
+    this.pendingConnect = ok;
 
     this.options = options;
     const u = server.src;
@@ -201,6 +206,16 @@ export class WsTransport implements Transport {
   }
 
   private async _closed(err?: Error, _internal = true): Promise<void> {
+    // camera.ui fork patch — settle any in-flight connect() first. A dial
+    // attempt killed mid-handshake (forceReconnect() during a dial calls
+    // transport.disconnect()) otherwise never observes the closure: onclose/
+    // onerror get nulled by _cleanup() and the dial hangs on its deferred
+    // until the protocol's raceTimer (options.timeout, default 20s) fires.
+    // Settling after resolve/reject is a no-op, so established connections
+    // are unaffected.
+    this.pendingConnect?.reject(
+      err ?? new errors.ConnectionError("transport closed during handshake"),
+    );
     if (this.done) {
       try {
         this.socket.close();

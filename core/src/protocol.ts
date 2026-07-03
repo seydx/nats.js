@@ -558,11 +558,12 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
 
   // camera.ui fork patch.
   // Unlike reconnect(), this works also when the protocol is NOT in the
-  // connected state — e.g. dial loop is sleeping on dialDelay or stuck on
-  // raceTimer mid-handshake against a now-unreachable host. Cancelling those
-  // timers makes the loop's current iteration resolve immediately so it
-  // picks up the current (possibly just-updated) servers list. If neither
-  // a live connection nor a running dial loop exists, kicks off a fresh one.
+  // connected state: a dial loop sleeping on dialDelay retries immediately
+  // (delay cancelled), a dial loop with an attempt in flight is left alone
+  // (the attempt is bounded by raceTimer and the loop self-retries), and if
+  // neither a live connection nor a running dial loop exists, a fresh one
+  // is kicked off. A live (possibly zombie) connection is torn down so the
+  // disconnected() handler starts the dial loop with the current servers.
   public forceReconnect(): Promise<void> {
     this.dispatchStatus({ type: "forceReconnect" });
     this.dialDelay?.cancel();
@@ -575,18 +576,14 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     }
 
     if (this.connectPromise !== null) {
-      // Dial loop is mid-handshake. Do NOT cancel raceTimer here:
-      // timeout().cancel() clears the timer without settling the promise,
-      // so cancelling would defuse the only deadline guarding a zombie
-      // transport — the dial could then hang forever and every further
-      // forceReconnect() would be a no-op (connectPromise stays non-null).
-      // Instead keep the deadline armed and force the current attempt to
-      // fail fast; the loop then retries with the updated servers list.
-      try {
-        this.transport?.disconnect();
-      } catch (_) {
-        // ignore — the race timer still bounds the attempt
-      }
+      // A dial loop is already driving recovery — leave the in-flight
+      // attempt alone. Killing it (previous behavior) threw away handshakes
+      // that were about to succeed (app-resume: staleConnection kicks off a
+      // dial ms before the caller's forceReconnect lands) and forced the
+      // loop through another reconnect wait. A genuinely stuck attempt is
+      // bounded by raceTimer (options.timeout), fails on its own, and the
+      // loop retries with the current servers list. dialDelay was cancelled
+      // above, so a loop sleeping between attempts retries immediately.
       return Promise.resolve();
     }
 
