@@ -167,6 +167,11 @@ export class WsTransport implements Transport {
       } else if (!evt.wasClean && evt.reason !== "") {
         reason = new Error(evt.reason);
       }
+      if (reason) {
+        // camera.ui fork patch — carry the close code structurally so
+        // consumers can classify without parsing reason strings
+        (reason as Error & { wsCloseCode?: number }).wsCloseCode = evt.code;
+      }
       this._closed(reason);
       this._cleanup();
     };
