@@ -417,6 +417,8 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
   options: ConnectionOptions;
   outbound: DataBuffer;
   pongs: Array<Deferred<void>>;
+  // camera.ui fork patch: when the ping behind each entry of `pongs` went out
+  pingTimes: number[];
   subscriptions: Subscriptions;
   transport!: Transport;
   noMorePublishing: boolean;
@@ -441,6 +443,9 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
   features: Features;
   connectPromise: Promise<void> | null;
   dialDelay: Delay | null;
+  // camera.ui fork patch: set by forceReconnect, the next dial skips what is
+  // left of the reconnect wait
+  redialNow: boolean;
   raceTimer?: Timeout<void>;
 
   constructor(options: ConnectionOptions, publisher: Publisher) {
@@ -462,12 +467,14 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     this.muxSubscriptions = new MuxSubscription();
     this.outbound = new DataBuffer();
     this.pongs = [];
+    this.pingTimes = [];
     this.whyClosed = "";
     //@ts-ignore: options.pendingLimit is hidden
     this.pendingLimit = options.pendingLimit || this.pendingLimit;
     this.features = new Features({ major: 0, minor: 0, micro: 0 });
     this.connectPromise = null;
     this.dialDelay = null;
+    this.redialNow = false;
 
     const servers = typeof options.servers === "string"
       ? [options.servers]
@@ -492,6 +499,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     this.outbound.reset();
     const pongs = this.pongs;
     this.pongs = [];
+    this.pingTimes = [];
     // reject the pongs - the disconnect from here shouldn't have a trace
     // because that confuses API consumers
     const err = new errors.RequestError("connection disconnected");
@@ -521,6 +529,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       // provide at least one catch - as pong rejection can happen before it is expected
     });
     this.pongs.unshift(pong);
+    this.pingTimes.unshift(Date.now());
 
     this.connectError = (err?: Error) => {
       pong.reject(err);
@@ -531,6 +540,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       .then(async (_err?) => {
         this.connected = false;
         if (!this.isClosed()) {
+          this.dispatchCloseCode(this.transport.closeError);
           // if the transport gave an error use that, otherwise
           // we may have received a protocol error
           await this.disconnected(this.transport.closeError || this.lastError);
@@ -566,6 +576,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
   // disconnected() handler starts the dial loop with the current servers.
   public forceReconnect(): Promise<void> {
     this.dispatchStatus({ type: "forceReconnect" });
+    this.redialNow = true;
     this.dialDelay?.cancel();
 
     if (this.connected) {
@@ -615,6 +626,21 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     return this.connected && this.heartbeats.hasExpired();
   }
 
+  // camera.ui fork patch: a server close code (4000-4999) on the live
+  // connection or on a reconnect handshake says why, e.g. an expired token.
+  // The first connect rejects with it instead.
+  dispatchCloseCode(err?: Error): void {
+    const code = (err as Error & { wsCloseCode?: number } | undefined)
+      ?.wsCloseCode;
+    if (
+      err && this.connectedOnce && typeof code === "number" && code >= 4000 &&
+      code <= 4999
+    ) {
+      // `data` for consumers written against the v2 status shape
+      this.dispatchStatus({ type: "error", error: err, data: err } as Status);
+    }
+  }
+
   async disconnected(err?: Error): Promise<void> {
     this.dispatchStatus(
       {
@@ -657,6 +683,8 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       (async () => {
         try {
           for await (const b of this.transport) {
+            // camera.ui fork patch — arriving bytes are a sign of life
+            this.heartbeats.inbound();
             this.parser.parse(b);
           }
         } catch (err) {
@@ -674,6 +702,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       this.connectError = undefined;
       this.sendSubscriptions();
       this.connectedOnce = true;
+      this.redialNow = false;
       this.server.didConnect = true;
       this.server.reconnects = 0;
       this.flushPending();
@@ -750,7 +779,11 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
         }
       }
       const now = Date.now();
-      if (srv.lastConnect === 0 || srv.lastConnect + wait <= now) {
+      if (
+        srv.lastConnect === 0 || srv.lastConnect + wait <= now ||
+        this.redialNow
+      ) {
+        this.redialNow = false;
         let target = srv;
         let extraDelay = 0;
         if (this.options.reconnectToServer) {
@@ -953,7 +986,10 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
 
   processPong() {
     const cb = this.pongs.shift();
+    const sentAt = this.pingTimes.shift();
     if (cb) {
+      // camera.ui fork patch: an answered ping can re-arm the heartbeat deadline
+      this.heartbeats.pong(sentAt!);
       cb.resolve();
     }
   }
@@ -1176,6 +1212,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       p = deferred<void>();
     }
     this.pongs.push(p);
+    this.pingTimes.push(Date.now());
     this.outbound.fill(PING_CMD);
     this.flushPending();
     return p;

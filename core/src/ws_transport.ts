@@ -33,6 +33,101 @@ import { errors, InvalidArgumentError } from "./errors.ts";
 const VERSION = version;
 const LANG = "nats.ws";
 
+// camera.ui fork patch: browsers behind Cloudflare lose permessage-deflate, so
+// a camera.ui relay that serves this client from beyond the LAN deflates its
+// frames itself when the url asks for it. It then tags every frame: 0 raw,
+// 1 deflated, led by the inflated length (uint32) and sharing one stream.
+const FRAME_DEFLATE_PARAM = "compress=cui-deflate";
+const FRAME_RAW = 0;
+const FRAME_DEFLATED = 1;
+const DEFLATED_HEADER = 5;
+// the empty stored block of a sync flush, the relay strips it from every frame
+const SYNC_FLUSH_TAIL = new Uint8Array([0x00, 0x00, 0xff, 0xff]);
+
+function withFrameDeflate(url: string): string {
+  return `${url}${url.includes("?") ? "&" : "?"}${FRAME_DEFLATE_PARAM}`;
+}
+
+function inflateStream(): DecompressionStream | null {
+  try {
+    return new DecompressionStream("deflate-raw");
+  } catch {
+    return null;
+  }
+}
+
+class FrameInflater {
+  private writer: WritableStreamDefaultWriter<BufferSource>;
+  private reader: ReadableStreamDefaultReader<Uint8Array>;
+  private backlog: Uint8Array[] = [];
+  private busy = false;
+  private closed = false;
+
+  constructor(
+    stream: DecompressionStream,
+    private deliver: (chunk: Uint8Array) => void,
+    private fail: (err: Error) => void,
+  ) {
+    this.writer = stream.writable.getWriter();
+    this.reader = stream.readable.getReader();
+  }
+
+  push(frame: Uint8Array): void {
+    if (this.busy) {
+      this.backlog.push(frame);
+      return;
+    }
+    if (frame[0] === FRAME_RAW) {
+      this.deliver(frame.subarray(1));
+      return;
+    }
+    this.busy = true;
+    this.drain(frame).catch((err) => {
+      if (!this.closed) this.fail(err);
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.backlog = [];
+    this.writer.abort().catch(() => {});
+  }
+
+  private async drain(first: Uint8Array): Promise<void> {
+    let frame: Uint8Array | undefined = first;
+    while (frame && !this.closed) {
+      if (frame[0] === FRAME_RAW) this.deliver(frame.subarray(1));
+      else if (frame[0] === FRAME_DEFLATED && frame.length > DEFLATED_HEADER) {
+        await this.inflate(frame);
+      } else throw new errors.ProtocolError("unexpected frame from relay");
+      frame = this.backlog.shift();
+    }
+    this.busy = false;
+  }
+
+  private async inflate(frame: Uint8Array): Promise<void> {
+    let remaining = new DataView(frame.buffer, frame.byteOffset, frame.length)
+      .getUint32(1);
+    const input = new Uint8Array(frame.length - 1);
+    input.set(frame.subarray(DEFLATED_HEADER));
+    input.set(SYNC_FLUSH_TAIL, frame.length - DEFLATED_HEADER);
+    const written = this.writer.write(input);
+    // a corrupt frame rejects both sides, the read below reports it
+    written.catch(() => {});
+    while (remaining > 0) {
+      const { value, done } = await this.reader.read();
+      if (done) throw new errors.ProtocolError("relay frame stream ended");
+      remaining -= value.length;
+      if (remaining < 0) {
+        throw new errors.ProtocolError("relay frame longer than announced");
+      }
+      this.deliver(value);
+    }
+    await written;
+  }
+}
+
 /**
  * WsSocketFactory is a factory that returns a WebSocket and a boolean
  * indicating if the connection is encrypted. Client code is responsible
@@ -75,6 +170,8 @@ export class WsTransport implements Transport {
   // camera.ui fork patch — the in-flight connect() deferred, so _closed()
   // can settle a dial attempt that is killed mid-handshake (see below).
   private pendingConnect: Deferred<void> | null;
+  // camera.ui fork patch: decided by the first frame, null for a plain server
+  private inflater?: FrameInflater | null;
 
   constructor() {
     this.version = VERSION;
@@ -99,12 +196,10 @@ export class WsTransport implements Transport {
     this.pendingConnect = ok;
 
     this.options = options;
-    const u = server.src;
+    const stream = inflateStream();
+    const u = stream ? withFrameDeflate(server.src) : server.src;
     if (options.wsFactory) {
-      const { socket, encrypted } = await options.wsFactory(
-        server.src,
-        options,
-      );
+      const { socket, encrypted } = await options.wsFactory(u, options);
       this.socket = socket;
       this.encrypted = encrypted;
     } else {
@@ -120,11 +215,11 @@ export class WsTransport implements Transport {
       // we don't do anything here...
     };
 
-    this.socket.onmessage = (me: MessageEvent) => {
+    const receive = (chunk: Uint8Array): void => {
       if (this.done) {
         return;
       }
-      this.yields.push(new Uint8Array(me.data));
+      this.yields.push(chunk);
       if (this.peeked) {
         this.signal.resolve();
         return;
@@ -152,6 +247,20 @@ export class WsTransport implements Transport {
           return;
         }
       }
+    };
+
+    this.socket.onmessage = (me: MessageEvent) => {
+      if (this.done) {
+        return;
+      }
+      const frame = new Uint8Array(me.data);
+      if (this.inflater === undefined) {
+        this.inflater = stream && frame[0] <= FRAME_DEFLATED
+          ? new FrameInflater(stream, receive, (err) => this._closed(err))
+          : null;
+      }
+      if (this.inflater) this.inflater.push(frame);
+      else receive(frame);
     };
 
     // @ts-ignore: CloseEvent is provided in browsers
@@ -194,6 +303,7 @@ export class WsTransport implements Transport {
   }
 
   _cleanup() {
+    this.inflater?.close();
     if (this.socketClosed === false) {
       // node seems to not emit closed if there's an error
       // all other runtimes do.
