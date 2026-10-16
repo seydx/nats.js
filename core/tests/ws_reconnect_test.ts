@@ -25,7 +25,7 @@ class FakeWsServer {
   sockets: WebSocket[] = [];
   answerPings = true;
   private server: Deno.HttpServer<Deno.NetAddr>;
-  private timers = new Set<number>();
+  private timers = new Set<ReturnType<typeof setTimeout>>();
 
   constructor(private plans: Plan[] = []) {
     this.server = Deno.serve(
